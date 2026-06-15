@@ -1,131 +1,26 @@
+
 import os
 import subprocess
 import random
 import json
 import time
+import re
 import numpy as np
 from typing import List, Dict, Any, Tuple
-import torch
-from transformers import GPTNeoForCausalGeneration, GPT2Tokenizer
 from groq import Groq
 import shutil
 # Configuration
-CHAMPSIM_PATH = "../ChampSim"  # Update this with your ChampSim path
-GROQ_API_KEY = "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"      # Set your OpenAI API key here or use environment variables
-TRACES_PATH = "traces/astar_163B.trace.xz"      # Path to ChampSim trace files
+CHAMPSIM_PATH = "ChampSim"  # Update this with your ChampSim path
+GROQ_API_KEY = "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"  # Set your OpenAI API key here or use environment variables
+TRACES_PATH = "ChampSim/traces"      # Path to ChampSim trace files
 OUTPUT_PATH = "./cache_policies"     # Where to store generated policies
-NUM_GENERATIONS = 4                 # Number of generations to run
-POPULATION_SIZE = 5                  # Number of policies per generation
-EVALUATION_CYCLES = 500000         # Simulation cycles for evaluation
+NUM_GENERATIONS = 2                 # Number of generations to run
+POPULATION_SIZE = 5                 # Number of policies per generation
+EVALUATION_CYCLES = 1000000         # Simulation cycles for evaluation
 
 # Initialize OpenAI client
 # openai.api_key = GROQ_API_KEY
 client = Groq(api_key=GROQ_API_KEY)
-
-# Initialize GPT-Neo model
-MODEL_NAME = "EleutherAI/gpt-neo-1.3B"  # Changed from OpenAI to GPT-Neo
-DEVICE = "cuda"  # Use "cpu" if no GPU available
-MAX_LENGTH = 2048
-TEMPERATURE = 0.8
-
-# Example successful policies for few-shot prompting
-EXAMPLE_POLICIES = [
-    {
-        "name": "hawkeye",
-        "description": "PC-based cache replacement policy",
-        "code": """
-#include "hawkeye.h"
-#include <vector>
-#include <unordered_map>
-
-class hawkeye : public replacement {
-private:
-    std::vector<unsigned> rrpv;
-    std::unordered_map<uint64_t, bool> pc_prediction;
-    
-public:
-    hawkeye(CACHE* cache) : 
-        replacement(cache),
-        rrpv(cache->NUM_SET * cache->NUM_WAY, 3) {}
-        
-    void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
-                                uint64_t full_addr, uint64_t pc, uint64_t victim_addr,
-                                uint32_t type, uint8_t hit) override {
-        if (hit) {
-            rrpv[set * NUM_WAY + way] = 0;
-            return;
-        }
-        
-        bool prediction = predict_reuse(pc);
-        rrpv[set * NUM_WAY + way] = prediction ? 0 : 3;
-        update_predictor(pc, prediction);
-    }
-    
-    uint32_t find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
-                        const BLOCK* current_set, uint64_t pc,
-                        uint64_t full_addr, uint32_t type) override {
-        for (uint32_t way = 0; way < NUM_WAY; way++) {
-            if (rrpv[set * NUM_WAY + way] == 3)
-                return way;
-        }
-        
-        for (uint32_t way = 0; way < NUM_WAY; way++)
-            rrpv[set * NUM_WAY + way]++;
-            
-        return find_victim(cpu, instr_id, set, current_set, pc, full_addr, type);
-    }
-};
-        """
-    },
-    {
-        "name": "ship",
-        "description": "Signature-based Hit Predictor cache replacement",
-        "code": """
-#include "ship.h"
-#include <vector>
-#include <bitset>
-
-class ship : public replacement {
-private:
-    std::vector<unsigned> rrpv;
-    std::vector<std::bitset<16>> signatures;
-    
-public:
-    ship(CACHE* cache) : 
-        replacement(cache),
-        rrpv(cache->NUM_SET * cache->NUM_WAY, 3),
-        signatures(cache->NUM_SET * cache->NUM_WAY) {}
-        
-    void update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
-                                uint64_t full_addr, uint64_t pc, uint64_t victim_addr,
-                                uint32_t type, uint8_t hit) override {
-        if (hit) {
-            rrpv[set * NUM_WAY + way] = 0;
-            update_signature(set, way, pc);
-            return;
-        }
-        
-        signatures[set * NUM_WAY + way] = calculate_signature(pc);
-        rrpv[set * NUM_WAY + way] = predict_reuse(signatures[set * NUM_WAY + way]) ? 1 : 3;
-    }
-    
-    uint32_t find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
-                        const BLOCK* current_set, uint64_t pc,
-                        uint64_t full_addr, uint32_t type) override {
-        for (uint32_t way = 0; way < NUM_WAY; way++) {
-            if (rrpv[set * NUM_WAY + way] == 3)
-                return way;
-        }
-        
-        for (uint32_t way = 0; way < NUM_WAY; way++)
-            rrpv[set * NUM_WAY + way]++;
-            
-        return find_victim(cpu, instr_id, set, current_set, pc, full_addr, type);
-    }
-};
-        """
-    }
-]
 
 class CachePolicy:
     """Represents a cache replacement policy implementation"""
@@ -165,173 +60,102 @@ class FunSearchCacheOptimizer:
         
         # Load the reference implementation
         self.reference_policy = self.load_reference_policy()
-        
-        # Initialize GPT-Neo model
-        self.tokenizer = GPT2Tokenizer.from_pretrained(MODEL_NAME)
-        self.model = GPTNeoForCausalGeneration.from_pretrained(MODEL_NAME)
-        if DEVICE == "cuda" and torch.cuda.is_available():
-            self.model = self.model.to("cuda")
     
     def load_reference_policy(self) -> CachePolicy:
-        """Load the reference DRRIP implementation"""
+        """Load the reference LRU implementation"""
         # You could also read this from a file
         reference_code = """
-#include "drrip.h"
+#include "lru_reference.h"
 
 #include <algorithm>
 #include <cassert>
-#include <random>
-#include <utility>
 
-#include "champsim.h"
+lru_reference::lru_reference(CACHE* cache) : lru_reference(cache, cache->NUM_SET, cache->NUM_WAY) {}
 
-drrip::drrip(CACHE* cache) : replacement(cache), NUM_SET(cache->NUM_SET), NUM_WAY(cache->NUM_WAY), rrpv(static_cast<std::size_t>(NUM_SET * NUM_WAY))
+lru_reference::lru_reference(CACHE* cache, long sets, long ways) : replacement(cache), NUM_WAY(ways), last_used_cycles(static_cast<std::size_t>(sets * ways), 0) {}
+
+long lru_reference::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                      champsim::address full_addr, access_type type)
 {
-  // randomly selected sampler sets
-  std::size_t TOTAL_SDM_SETS = NUM_CPUS * NUM_POLICY * SDM_SIZE;
-  std::generate_n(std::back_inserter(rand_sets), TOTAL_SDM_SETS, std::knuth_b{1});
-  std::sort(std::begin(rand_sets), std::end(rand_sets));
-  std::fill_n(std::back_inserter(PSEL), NUM_CPUS, typename decltype(PSEL)::value_type{0});
-}
-
-unsigned& drrip::get_rrpv(long set, long way) { return rrpv.at(static_cast<std::size_t>(set * NUM_WAY + way)); }
-
-void drrip::update_bip(long set, long way)
-{
-  get_rrpv(set, way) = maxRRPV;
-
-  bip_counter++;
-  if (bip_counter == BIP_MAX) {
-    bip_counter = 0;
-    get_rrpv(set, way) = maxRRPV - 1;
-  }
-}
-
-void drrip::update_srrip(long set, long way) { get_rrpv(set, way) = maxRRPV - 1; }
-
-// called on every cache hit and cache fill
-void drrip::update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
-                                     champsim::address victim_addr, access_type type, uint8_t hit)
-{
-  // do not update replacement state for writebacks
-  if (access_type{type} == access_type::WRITE) {
-    get_rrpv(set, way) = maxRRPV - 1;
-    return;
-  }
-
-  // cache hit
-  if (hit) {
-    get_rrpv(set, way) = 0; // for cache hit, DRRIP always promotes a cache line to the MRU position
-    return;
-  }
-
-  // cache miss
-  auto begin = std::next(std::begin(rand_sets), triggering_cpu * NUM_POLICY * SDM_SIZE);
-  auto end = std::next(begin, NUM_POLICY * SDM_SIZE);
-  auto leader = std::find(begin, end, set);
-
-  if (leader == end) { // follower sets
-    auto selector = PSEL[triggering_cpu];
-    if (selector.value() > (selector.maximum / 2)) { // follow BIP
-      update_bip(set, way);
-    } else { // follow SRRIP
-      update_srrip(set, way);
-    }
-  } else if (leader == begin) { // leader 0: BIP
-    PSEL[triggering_cpu]--;
-    update_bip(set, way);
-  } else if (leader == std::next(begin)) { // leader 1: SRRIP
-    PSEL[triggering_cpu]++;
-    update_srrip(set, way);
-  }
-}
-
-// find replacement victim
-long drrip::find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
-                        champsim::address full_addr, access_type type)
-{
-  // look for the maxRRPV line
-  auto begin = std::next(std::begin(rrpv), set * NUM_WAY);
+  auto begin = std::next(std::begin(last_used_cycles), set * NUM_WAY);
   auto end = std::next(begin, NUM_WAY);
 
-  auto victim = std::max_element(begin, end);
-  if (auto rrpv_update = maxRRPV - *victim; rrpv_update != 0)
-    for (auto it = begin; it != end; ++it)
-      *it += rrpv_update;
-
+  // Find the way whose last use cycle is most distant
+  auto victim = std::min_element(begin, end);
   assert(begin <= victim);
   assert(victim < end);
-  return std::distance(begin, victim); // cast protected by assertions
+  return std::distance(begin, victim);
+}
+
+void lru_reference::replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip, champsim::address victim_addr,
+                                 access_type type)
+{
+  // Mark the way as being used on the current cycle
+  last_used_cycles.at((std::size_t)(set * NUM_WAY + way)) = cycle++;
+}
+
+void lru_reference::update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip,
+                                   champsim::address victim_addr, access_type type, uint8_t hit)
+{
+  // Mark the way as being used on the current cycle
+  if (hit && access_type{type} != access_type::WRITE) // Skip this for writeback hits
+    last_used_cycles.at((std::size_t)(set * NUM_WAY + way)) = cycle++;
 }
 """
         reference_header = """
-#ifndef DRRIP_H
-#define DRRIP_H
+#ifndef REPLACEMENT_LRUREF_H
+#define REPLACEMENT_LRUREF_H
 
 #include <vector>
-#include <deque>
-#include <unordered_map>
-#include <array>
-#include <limits>
-#include <cstdint>
 
 #include "cache.h"
-#include "replacement.h"
-#include "champsim.h"
+#include "modules.h"
 
-class drrip : public replacement
+class lru_reference : public champsim::modules::replacement
 {
-private:
-  const std::size_t NUM_SET;
-  const std::size_t NUM_WAY;
-  
-  // DRRIP constants
-  static constexpr unsigned int maxRRPV = 3;
-  static constexpr unsigned int NUM_POLICY = 2;
-  static constexpr unsigned int SDM_SIZE = 32;
-  static constexpr unsigned int BIP_MAX = 32;
-  
-  // Cache line states
-  std::vector<unsigned> rrpv;
-  
-  // Set dueling mechanism
-  std::vector<long> rand_sets;
-  std::vector<saturating_counter<8>> PSEL;
-  
-  unsigned int bip_counter = 0;
-  
-  unsigned& get_rrpv(long set, long way);
-  void update_bip(long set, long way);
-  void update_srrip(long set, long way);
+  long NUM_WAY;
+  std::vector<uint64_t> last_used_cycles;
+  uint64_t cycle = 0;
 
 public:
-  drrip(CACHE* cache);
+  explicit lru_reference(CACHE* cache);
+  lru_reference(CACHE* cache, long sets, long ways);
 
-  long find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, 
-                   champsim::address ip, champsim::address full_addr, access_type type) override;
-                   
-  void update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, 
-                               champsim::address ip, champsim::address victim_addr, access_type type, uint8_t hit) override;
+  // void initialize_replacement();
+  long find_victim(uint32_t triggering_cpu, uint64_t instr_id, long set, const champsim::cache_block* current_set, champsim::address ip,
+                   champsim::address full_addr, access_type type);
+  void replacement_cache_fill(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip, champsim::address victim_addr,
+                              access_type type);
+  void update_replacement_state(uint32_t triggering_cpu, long set, long way, champsim::address full_addr, champsim::address ip, champsim::address victim_addr,
+                                access_type type, uint8_t hit);
+  // void replacement_final_stats()
 };
 
-#endif // DRRIP_H
+#endif
 """
-        policy = CachePolicy(code=reference_code, name="drrip_reference")
-        self.all_policies["drrip_reference"] = policy
+        policy = CachePolicy(code=reference_code, name="lru_reference")
+        self.all_policies["lru_reference"] = policy
         
         # Save the header file for reference
-        with open(os.path.join(OUTPUT_PATH, "drrip.h"), "w") as f:
+        with open(os.path.join(OUTPUT_PATH, "lru_reference.h"), "w") as f:
             f.write(reference_header)
+
+        # Save the header file for reference
+        with open(os.path.join(OUTPUT_PATH, "lru_reference.cc"), "w") as f:
+            f.write(reference_code)
             
         return policy
     
     def generate_initial_population(self) -> List[str]:
         """Generate the initial population of cache policies"""
         policies = []
-        
+        with open(os.path.join(OUTPUT_PATH, "lru_reference.h"), "r") as f:
+            reference_header = f.read()
+        with open(os.path.join(OUTPUT_PATH, "lru_reference.cc"), "r") as f:
+            reference_code = f.read()
         # Define the LLM prompt to generate the initial population
         prompt = """
-You are a cache replacement policy expert. I want you to create a new cache replacement policy for the ChampSim simulator that improves upon the DRRIP (Dynamic Re-Reference Interval Prediction) policy.
+You are a cache replacement policy expert. I want you to create a new cache replacement policy for the ChampSim simulator that improves upon the LRU policy.
 
 Your replacement policy should focus on optimizing these aspects:
 1. Better prediction of re-reference patterns
@@ -340,14 +164,25 @@ Your replacement policy should focus on optimizing these aspects:
 4. Improved set dueling mechanism
 5. Lower MPKI (Misses Per Kilo Instructions)
 
-Here is the reference implementation of DRRIP:
+Here is the reference implementation of LRU:
+
+```cpp
+{reference_header}
+```
 
 ```cpp
 {reference_code}
 ```
 
-Generate a completely new implementation with a unique class name. The policy should be based on the same structure but have improved logic. Include both .h and .cc files.
-Your implementation must be compatible with ChampSim and must compile with C++17.
+Generate a completely new implementation with a unique class name. The policy should be based on the exact same structure but have improved logic.
+Your implementation must be compatible with ChampSim and must compile with C++. If you are trying to use any class variables, make sure appropriate function is used.
+Do not make any unnecessary imports or unnecessary inheritance, only import the same files as provided in the reference or required standard libraries.
+Also make sure that the imported header has the correct name, same as the class name. Refer closely to the structure of the reference code.
+Return the implementation (.cc) and header (.h) file content.
+You don't have to override in the header. And while using functions like std::max, make sure the types are correct and supported.
+Make sure the members you are trying to access exist. I do not want any kinds of compilation errors whatsoever. Check multiple times.
+
+Target C++17, must build with g++ -std=c++17 -Wall -Werror.
 
 Make the policy innovative, focusing on incorporating techniques like:
 - PC-based prediction
@@ -357,7 +192,9 @@ Make the policy innovative, focusing on incorporating techniques like:
 - Signature-based patterns
 - Bypassing for low-utility blocks
 
-Name your class something unique, not drrip. Include detailed comments explaining your innovations.
+Name your class something unique, not lru or lru_reference. Include detailed comments explaining your innovations.
+Make sure there are NO compilation errors. Check it thoroughly. It should compile without any problem.
+Class name should be in snake case.
 """
         
         for i in range(POPULATION_SIZE):
@@ -365,10 +202,10 @@ Name your class something unique, not drrip. Include detailed comments explainin
             
             # Generate a policy using the LLM
             response = client.chat.completions.create(
-                model = "llama-3.3-70b-versatile",
+                model = "deepseek-r1-distill-llama-70b",
                 messages=[
                     {"role": "system", "content": "You are a cache replacement policy expert specializing in C++ implementations for ChampSim."},
-                    {"role": "user", "content": prompt.format(reference_code=self.reference_policy.code)}
+                    {"role": "user", "content": prompt.format(reference_code=reference_code,reference_header=reference_header)}
                 ],
                 temperature=0.8,  # Higher temperature for more diversity
                 max_tokens=4000
@@ -376,19 +213,25 @@ Name your class something unique, not drrip. Include detailed comments explainin
             
             # Extract the code from the response
             generated_text = response.choices[0].message.content
-            
+            print(generated_text)
             # Parse the header and implementation files
-            policy_code = self.extract_code(generated_text)
+            policy_codes = self.extract_code(generated_text)
+            policy_header = policy_codes[0]
+            policy_code = policy_codes[1]
             
             if policy_code:
                 policy_name = self.extract_policy_name(policy_code)
-                policy = CachePolicy(code=policy_code, name=f"{policy_name}_gen0_{i}")
+                policy = CachePolicy(code=policy_code, name=f"{policy_name}")
+                print(policy_name)
                 self.all_policies[policy.name] = policy
                 policies.append(policy.name)
                 
                 # Save the policy code to file
                 with open(os.path.join(OUTPUT_PATH, f"{policy.name}.cc"), "w") as f:
                     f.write(policy_code)
+                    # Save the policy header to file
+                with open(os.path.join(OUTPUT_PATH, f"{policy.name}.h"), "w") as f:
+                    f.write(policy_header)
             else:
                 print(f"Failed to extract code for policy {i+1}")
         
@@ -397,7 +240,7 @@ Name your class something unique, not drrip. Include detailed comments explainin
     
     def extract_code(self, text: str) -> str:
         """Extract code blocks from the generated text"""
-        # Extract code between ```cpp and ```
+        # Extract code between ```cc and ```
         import re
         cpp_blocks = re.findall(r'```cpp\n(.*?)```', text, re.DOTALL)
         
@@ -405,85 +248,38 @@ Name your class something unique, not drrip. Include detailed comments explainin
             # Try without the language specifier
             cpp_blocks = re.findall(r'```\n(.*?)```', text, re.DOTALL)
         
-        if cpp_blocks:
-            # Find the .cc implementation file
-            for block in cpp_blocks:
-                if "update_replacement_state" in block and "find_victim" in block:
-                    return block
+        # if cpp_blocks:
+        #     # Find the .cc implementation file
+        #     for block in cpp_blocks:
+        #         if "update_replacement_state" in block and "find_victim" in block:
+        #             return block
                     
-        return None
+        return cpp_blocks
+    
+    # def extract_policy_name(self, code: str) -> str:
+    #     """Extract the policy class name from the code"""
+    #     import re
+    #     # Try to find class name pattern
+    #     match = re.search(r'class\s+(\w+)\s*:', code)
+    #     if match:
+    #         return match.group(1)
+            
+    #     # Fallback to a default name
+    #     return f"policy_{random.randint(1000, 9999)}"
     
     def extract_policy_name(self, code: str) -> str:
-        """Extract the policy class name from the code"""
+        """Extract the policy class name from the code, including constructor patterns like class::class"""
         import re
-        # Try to find class name pattern
-        match = re.search(r'class\s+(\w+)\s*:', code)
+        import random
+
+        # Look for patterns like: classname::classname(
+        match = re.search(r'(\w+)::\1\s*\(', code)
         if match:
             return match.group(1)
-            
+
         # Fallback to a default name
         return f"policy_{random.randint(1000, 9999)}"
-    
-    def generate_policy_with_gptneo(self, parents: List[str]) -> str:
-        """Generate a new policy using GPT-Neo with few-shot examples"""
-        # Create prompt with examples and parent policies
-        prompt = "Generate a new cache replacement policy for ChampSim. Here are some example successful policies:\n\n"
-        
-        # Add few-shot examples
-        for example in EXAMPLE_POLICIES:
-            prompt += f"// Example policy: {example['name']}\n"
-            prompt += f"// {example['description']}\n"
-            prompt += f"{example['code']}\n\n"
-            
-        # Add parent policies if available
-        if parents:
-            prompt += "Parent policies to improve upon:\n\n"
-            for parent in parents:
-                policy = self.all_policies[parent]
-                prompt += f"// Parent policy: {policy.name}\n"
-                prompt += f"{policy.code}\n\n"
-                
-        prompt += "Generate a new policy that combines the best features and improves upon them.\n"
-        
-        # Tokenize and generate
-        inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=MAX_LENGTH)
-        if DEVICE == "cuda" and torch.cuda.is_available():
-            inputs = inputs.to("cuda")
-            
-        outputs = self.model.generate(
-            **inputs,
-            max_length=MAX_LENGTH,
-            temperature=TEMPERATURE,
-            num_return_sequences=1,
-            pad_token_id=self.tokenizer.eos_token_id
-        )
-        
-        generated_code = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-        return self.extract_cpp_code(generated_code)
-    
-    def extract_cpp_code(self, generated_text: str) -> str:
-        """Extract C++ code from generated text, applying fixes for common issues"""
-        import re
-        
-        # Extract code between class definition and end of file or next comment block
-        match = re.search(r'class\s+\w+.*?(?:\/\/|$)', generated_text, re.DOTALL)
-        if not match:
-            return None
-            
-        code = match.group(0)
-        
-        # Fix common issues
-        # 1. Ensure proper includes
-        if "#include" not in code:
-            code = "#include <vector>\n#include <algorithm>\n" + code
-            
-        # 2. Check for missing semicolons after class definition
-        code = re.sub(r'}\s*$', '};', code)
-        
-        # 3. Fix common syntax errors
-        code = code.replace('override;', 'override')
-        
-        return code
+
 
     def compile_policy(self, policy_name: str) -> bool:
         """Compile the policy with ChampSim"""
@@ -497,14 +293,19 @@ Name your class something unique, not drrip. Include detailed comments explainin
 
         try:
             # 1) Create a subdirectory for this policy
-            policy_dir = os.path.join(repl_root, policy.name)
+            policy_dir = os.path.join(repl_root, policy_name)
             os.makedirs(policy_dir, exist_ok=True)
 
             # 2) Copy the .cc and .h into that subdirectory
             shutil.copy(policy_file, os.path.join(policy_dir, f"{policy.name}.cc"))
-            # regenerate header just in case
-            self.generate_header_file(policy_name)
             shutil.copy(header_file, os.path.join(policy_dir, f"{policy.name}.h"))
+            # regenerate header just in case
+
+            # if policy.name == 'lru_reference':
+            #     shutil.copy(header_file, os.path.join(policy_dir, f"{policy.name}.h"))
+            # else:
+            #     self.generate_header_file(policy_name)
+            #     shutil.copy(header_file, os.path.join(policy_dir, f"{policy.name}.h"))
 
             # 3) Decide which build to run
             build_script = os.path.join(CHAMPSIM_PATH, "build_champsim.sh")
@@ -708,11 +509,18 @@ Name your class something unique, not drrip. Include detailed comments explainin
                         }
 
                 cfg_path = os.path.join(CHAMPSIM_PATH, f"{policy.name}_cfg.json")
+                filepath = os.path.join( f"{policy.name}_cfg.json")
+
                 with open(cfg_path, "w") as f:
                     json.dump(cfg, f, indent=2)
 
                 #   b) Run config.sh and make
-                subprocess.run(f"./config.sh {cfg_path}",
+                subprocess.run("make clean",
+                                    shell=True,
+                                    cwd=CHAMPSIM_PATH,
+                                    stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+                subprocess.run(f"./config.sh {filepath}",
                             shell=True,
                             cwd=CHAMPSIM_PATH,
                             check=True)
@@ -723,6 +531,9 @@ Name your class something unique, not drrip. Include detailed comments explainin
                                     stderr=subprocess.PIPE)
 
             # 4) Check build result
+            if os.path.exists(policy_dir):
+                shutil.rmtree(policy_dir)
+
             if proc.returncode == 0:
                 policy.compilation_success = True
                 print(f"Successfully compiled {policy.name}")
@@ -733,12 +544,97 @@ Name your class something unique, not drrip. Include detailed comments explainin
 
         except Exception as e:
             print(f"Error during compilation of {policy_name}: {e}")
+            if os.path.exists(policy_dir):
+                shutil.rmtree(policy_dir)
             return False
+
+    
+    
+    # def compile_policy(self, policy_name: str) -> bool:
+    #     """Compile the policy with ChampSim"""
+    #     policy = self.all_policies[policy_name]
+        
+    #     # Create a temporary directory for compilation
+    #     temp_dir = os.path.join(OUTPUT_PATH, f"temp_{policy_name}")
+    #     os.makedirs(temp_dir, exist_ok=True)
+        
+    #     # Copy the policy file to ChampSim's replacement directory
+    #     policy_file = os.path.join(OUTPUT_PATH, f"{policy_name}.cc")
+    #     champsim_replacement_dir = os.path.join(CHAMPSIM_PATH, "replacement")
+        
+        
+        
+    #     try:
+    #         # Copy policy file to ChampSim
+    #         subprocess.run(["cp", policy_file, champsim_replacement_dir], check=True)
+            
+    #         # Generate the header file
+    #         self.generate_header_file(policy_name)
+            
+    #         # Copy header file to ChampSim
+    #         header_file = os.path.join(OUTPUT_PATH, f"{policy_name}.h")
+    #         subprocess.run(["cp", header_file, champsim_replacement_dir], check=True)
+            
+    #         # Build ChampSim with the new policy
+    #         os.chdir(CHAMPSIM_PATH)
+            
+    #         # code added
+    #         #####################################################
+    #         if os.path.isfile("build_champsim.sh"):
+    #             # existing Sacusa‐fork build
+    #             build_cmd = f"./build_champsim.sh bimodal no no no no {policy_name} 1"
+    #             proc = subprocess.run(build_cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    #         else:
+    #             # official upstream build
+    #             # 1) write a temp JSON config
+    #             cfg = {
+    #                 "BPT":  {"branch_predictor": "bimodal"},
+    #                 "L1D":  {"prefetcher": "no"},
+    #                 "L2C":  {"prefetcher": "no"},
+    #                 "LLC":  {"replacement": policy_name},
+    #                 "NUM_CORE": 1
+    #             }
+    #             cfg_path = os.path.join(CHAMPSIM_PATH, f"{policy_name}_cfg.json")
+    #             with open(cfg_path, "w") as f:
+    #                 json.dump(cfg, f, indent=2)
+    #             # 2) run config.sh + make
+    #             subprocess.run(f"./config.sh {cfg_path}", shell=True, check=True)
+    #             proc = subprocess.run("make -j", shell=True, check=False)
+    #         if proc.returncode == 0:
+    #             policy.compilation_success = True
+    #             return True
+    #         else:
+    #             print("Build failed:", proc.stderr.decode())
+    #             return False
+
+    #         #######################################################
+            
+            
+            
+    #         # build_command = f"./build_champsim.sh bimodal no no no no {policy_name} 1"
+    #         # process = subprocess.run(build_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+    #         # if process.returncode == 0:
+    #         #     policy.compilation_success = True
+    #         #     print(f"Successfully compiled {policy_name}")
+    #         #     return True
+    #         # else:
+    #         #     print(f"Failed to compile {policy_name}: {process.stderr.decode()}")
+    #         #     return False
+                
+    #     except Exception as e:
+    #         print(f"Error during compilation of {policy_name}: {str(e)}")
+    #         return False
+            
+    #     finally:
+    #         # Clean up temporary directory
+    #         subprocess.run(["rm", "-rf", temp_dir])
     
     def generate_header_file(self, policy_name: str) -> None:
         """Generate a header file for the policy based on the implementation"""
         policy = self.all_policies[policy_name]
-        
+        with open(os.path.join(OUTPUT_PATH, "lru_reference.h"), "r") as f:
+            reference_header = f.read()
         # Use LLM to generate a matching header file
         prompt = f"""
 Based on the following C++ implementation of a cache replacement policy for ChampSim, create a matching header (.h) file:
@@ -753,6 +649,10 @@ The header file should:
 3. Include all required headers
 4. Use proper include guards
 5. Match the class name and method signatures exactly as used in the implementation
+6. Do not make any unnecessary imports or unncessary inheritance.
+
+Below is the reference of a header file you can follow:
+{reference_header}
 
 Return only the header file code.
 """
@@ -767,6 +667,7 @@ Return only the header file code.
         )
         
         header_code = response.choices[0].message.content
+        #print(header_code)
         
         # Extract the code from markdown if needed
         import re
@@ -806,13 +707,13 @@ Return only the header file code.
             
             for trace in traces:
                 # Run ChampSim with the policy
-                binary_path = os.path.join(CHAMPSIM_PATH, "bin", f"bimodal-no-no-no-no-{policy_name}-1core")
+                binary_path = os.path.join(CHAMPSIM_PATH, "bin", f"{policy_name}")
                 trace_path = os.path.join(TRACES_PATH, trace)
                 output_file = os.path.join(OUTPUT_PATH, f"{policy_name}_{trace}_output.txt")
                 
                 # Run simulation
                 print(f"Evaluating {policy_name} on {trace}...")
-                command = f"{binary_path} -warmup_instructions 10000000 -simulation_instructions {EVALUATION_CYCLES} {trace_path} > {output_file}"
+                command = f"{binary_path} --warmup_instructions 100000 --simulation_instructions {EVALUATION_CYCLES} {trace_path} > {output_file}"
                 process = subprocess.run(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 
                 if process.returncode != 0:
@@ -858,16 +759,35 @@ Return only the header file code.
             with open(output_file, "r") as f:
                 content = f.read()
                 
-                # Parse MPKI (misses per kilo instructions)
-                mpki_match = re.search(r'LLC TOTAL[\s\S]*?MPKI: ([\d\.]+)', content)
+                # # Parse MPKI (misses per kilo instructions)
+                # mpki_match = re.search(r'LLC TOTAL[\s\S]*?MPKI: ([\d\.]+)', content)
                 
-                # Parse IPC (instructions per cycle)
-                ipc_match = re.search(r'CPU 0 cumulative IPC: ([\d\.]+)', content)
+                # # Parse IPC (instructions per cycle)
+                # ipc_match = re.search(r'CPU 0 cumulative IPC: ([\d\.]+)', content)
                 
-                if mpki_match and ipc_match:
-                    mpki = float(mpki_match.group(1))
+                # if mpki_match and ipc_match:
+                #     mpki = float(mpki_match.group(1))
+                #     ipc = float(ipc_match.group(1))
+                #     return mpki, ipc
+                
+                ipc_match = re.search(r'CPU 0 cumulative IPC: ([\d\.]+) instructions:', content)
+
+                # MPKI
+                mpki_match = re.search(r'MPKI: ([\d\.]+)', content)
+
+                # LLC TOTAL line
+                llc_match = re.search(
+                    r'cpu0->LLC TOTAL\s+ACCESS:\s+(\d+)\s+HIT:\s+(\d+)\s+MISS:\s+(\d+)',
+                    content
+                )
+
+                if ipc_match and mpki_match and llc_match:
                     ipc = float(ipc_match.group(1))
-                    return mpki, ipc
+                    mpki = float(mpki_match.group(1))
+                    llc_access = int(llc_match.group(1))
+                    llc_hit = int(llc_match.group(2))
+                    llc_miss = int(llc_match.group(3))
+                    return llc_miss, ipc
         
         except Exception as e:
             print(f"Error parsing results from {output_file}: {str(e)}")
@@ -886,7 +806,7 @@ Return only the header file code.
         
         if len(valid_policies) < num_parents:
             # Not enough valid policies, supplement with reference
-            valid_policies.append("drrip_reference")
+            valid_policies.append("lru_reference")
         
         # Tournament selection
         parents = []
@@ -909,30 +829,6 @@ Return only the header file code.
     
     def generate_new_policy(self, parents: List[str], generation_num: int, policy_idx: int) -> str:
         """Generate a new policy through 'crossover' using the LLM"""
-        # Try using GPT-Neo first
-        try:
-            policy_code = self.generate_policy_with_gptneo(parents)
-            if policy_code:
-                policy_name = self.extract_policy_name(policy_code)
-                unique_name = f"{policy_name}_gen{generation_num}_{policy_idx}"
-                
-                policy = CachePolicy(
-                    code=policy_code,
-                    name=unique_name,
-                    parent_policies=parents
-                )
-                
-                self.all_policies[unique_name] = policy
-                
-                # Save the policy code to file
-                with open(os.path.join(OUTPUT_PATH, f"{unique_name}.cc"), "w") as f:
-                    f.write(policy_code)
-                    
-                return unique_name
-        except Exception as e:
-            print(f"GPT-Neo generation failed: {e}. Falling back to API-based generation.")
-        
-        # Fallback to API-based generation
         parent_policies = [self.all_policies[p] for p in parents]
         
         # Create a prompt that includes the parent policies
@@ -960,31 +856,54 @@ Generate a new policy that:
 3. Focuses on reducing cache misses (MPKI)
 4. Has a unique class name
 
-Your implementation should be compatible with ChampSim and compile with C++17.
-Focus on optimizing how the cache decides which blocks to evict when new data needs to be cached.
+The policy should be based on the exact same structure but have improved logic.
+Your implementation must be compatible with ChampSim and must compile with C++. If you are trying to use any class variables, make sure appropriate function is used.
+Do not make any unnecessary imports or unnecessary inheritance, only import the same files as provided in the reference or required standard libraries.
+Also make sure that the imported header has the correct name, same as the class name. Refer closely to the structure of the reference code.
+Return the implementation (.cc) and header (.h) file content.
+You don't have to override in the header. And while using functions like std::max or std::abs, make sure the types are correct and supported.
+Make sure the members you are trying to access exist. I do not want any kinds of compilation errors whatsoever. Check multiple times.
 
-Return ONLY the implementation (.cc) file content. The header will be automatically generated.
+Target C++17, must build with g++ -std=c++17 -Wall -Werror.
+
+Include detailed comments explaining your innovations.
+Make sure there are NO compilation errors. Check it thoroughly. It should compile without any problem.
+Class name should be in snake case.
+
+Return the implementation (.cc) file content and the (.h) header file.
 """
         
+
         # Generate a new policy using the LLM
+        
         response = client.chat.completions.create(
-            model = "llama-3.3-70b-versatile",
+            model = "deepseek-r1-distill-llama-70b",
             messages=[
                 {"role": "system", "content": "You are a cache replacement policy expert specializing in C++ implementations for ChampSim."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7  # Balance between innovation and reliability
         )
-        print(response.choices[0].message.content)
+        #print(response.choices[0].message.content)
+        # response = openai.chat.completions.create(
+        #     model="gpt-4o",
+        #     messages=[
+        #         {"role": "system", "content": "You are a cache replacement policy expert specializing in C++ implementations for ChampSim."},
+        #         {"role": "user", "content": prompt}
+        #     ],
+        #     temperature=0.7  # Balance between innovation and reliability
+        # )
         
         # Extract the code from the response
         generated_text = response.choices[0].message.content
-        policy_code = self.extract_code(generated_text)
-        
+        policy_codes = self.extract_code(generated_text)
+        policy_code = policy_codes[1]
+        policy_header = policy_codes[0]
+
         if policy_code:
             policy_name = self.extract_policy_name(policy_code)
             # Ensure unique name by adding generation and index
-            unique_name = f"{policy_name}_gen{generation_num}_{policy_idx}"
+            unique_name = f"{policy_name}"
             
             policy = CachePolicy(
                 code=policy_code, 
@@ -997,6 +916,8 @@ Return ONLY the implementation (.cc) file content. The header will be automatica
             # Save the policy code to file
             with open(os.path.join(OUTPUT_PATH, f"{unique_name}.cc"), "w") as f:
                 f.write(policy_code)
+            with open(os.path.join(OUTPUT_PATH, f"{unique_name}.h"), "w") as f:
+                f.write(policy_header)
                 
             return unique_name
         else:
@@ -1012,9 +933,9 @@ Return ONLY the implementation (.cc) file content. The header will be automatica
         
         # Evaluate reference policy
         print("Evaluating reference policy...")
-        self.compile_policy("drrip_reference")
-        self.evaluate_policy("drrip_reference")
-        reference_fitness = self.all_policies["drrip_reference"].fitness
+        self.compile_policy("lru_reference")
+        self.evaluate_policy("lru_reference")
+        reference_fitness = self.all_policies["lru_reference"].fitness
         print(f"Reference policy fitness: {reference_fitness}")
         
         # Run generations
@@ -1041,7 +962,7 @@ Return ONLY the implementation (.cc) file content. The header will be automatica
                 parents = self.select_parents(current_generation)
                 if not parents:
                     print("No suitable parents found, using reference policy")
-                    parents = ["drrip_reference"]
+                    parents = ["lru_reference"]
                 
                 # Generate new policy
                 new_policy = self.generate_new_policy(parents, gen+1, i)
@@ -1076,7 +997,7 @@ Return ONLY the implementation (.cc) file content. The header will be automatica
                           if policy.fitness is not None and policy.fitness != float('-inf')}
         
         if not valid_policies:
-            return "drrip_reference"
+            return "lru_reference"
         
         return max(valid_policies.items(), key=lambda x: x[1].fitness)[0]
     
